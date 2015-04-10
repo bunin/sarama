@@ -536,29 +536,31 @@ func (client *client) backgroundMetadataUpdater() {
 	}
 }
 
-func (client *client) tryRefreshMetadata(topics []string, retriesRemaining int) error {
+func (client *client) tryRefreshMetadata(topics []string, attemptsRemaining int) error {
+	retry := func(err error) error {
+		if attemptsRemaining > 0 {
+			Logger.Printf("client/metadata Retrying after %dms... (%d attempts remaining)\n", client.conf.Metadata.Retry.Backoff/time.Millisecond, attemptsRemaining)
+			time.Sleep(client.conf.Metadata.Retry.Backoff)
+			return client.tryRefreshMetadata(topics, attemptsRemaining-1)
+		}
+		return err
+	}
+
 	for broker := client.any(); broker != nil; broker = client.any() {
 		if len(topics) > 0 {
-			Logger.Printf("Fetching metadata for %v from broker %s\n", topics, broker.addr)
+			Logger.Printf("client/metadata Fetching metadata for %v from broker %s\n", topics, broker.addr)
 		} else {
-			Logger.Printf("Fetching metadata for all topics from broker %s\n", broker.addr)
+			Logger.Printf("client/metadata Fetching metadata for all topics from broker %s\n", broker.addr)
 		}
 		response, err := broker.GetMetadata(&MetadataRequest{Topics: topics})
 
 		switch err.(type) {
 		case nil:
 			// valid response, use it
-			retry, err := client.updateMetadata(response)
-
-			if len(retry) > 0 {
-				if retriesRemaining <= 0 {
-					Logger.Println("Some partitions are leaderless, but we're out of retries")
-					return err
-				}
-				Logger.Printf("Some partitions are leaderless, waiting %dms for election... (%d retries remaining)\n",
-					client.conf.Metadata.Retry.Backoff/time.Millisecond, retriesRemaining)
-				time.Sleep(client.conf.Metadata.Retry.Backoff) // wait for leader election
-				return client.tryRefreshMetadata(retry, retriesRemaining-1)
+			toRetry, err := client.updateMetadata(response)
+			if len(toRetry) > 0 {
+				Logger.Println("client/metadata Some partitions are leaderless.")
+				return retry(err) // note: err can be nil
 			}
 
 			return err
@@ -567,23 +569,15 @@ func (client *client) tryRefreshMetadata(topics []string, retriesRemaining int) 
 			return err
 		default:
 			// some other error, remove that broker and try again
-			Logger.Println("Error from broker while fetching metadata:", err)
+			Logger.Println("client/metadata Error from broker while fetching metadata:", err)
 			_ = broker.Close()
 			client.deregisterBroker(broker)
 		}
 	}
 
-	Logger.Println("Out of available brokers.")
-
-	if retriesRemaining > 0 {
-		Logger.Printf("Resurrecting dead brokers after %dms... (%d retries remaining)\n",
-			client.conf.Metadata.Retry.Backoff/time.Millisecond, retriesRemaining)
-		time.Sleep(client.conf.Metadata.Retry.Backoff)
-		client.resurrectDeadBrokers()
-		return client.tryRefreshMetadata(topics, retriesRemaining-1)
-	}
-
-	return ErrOutOfBrokers
+	Logger.Println("client/metadata No broker available to send metadata request to.")
+	client.resurrectDeadBrokers()
+	return retry(ErrOutOfBrokers)
 }
 
 // if no fatal error, returns a list of topics that need retrying due to ErrLeaderNotAvailable
@@ -657,7 +651,16 @@ func (client *client) cachedCoordinator(consumerGroup string) *Broker {
 	}
 }
 
-func (client *client) getConsumerMetadata(consumerGroup string, retriesRemaining int) (*ConsumerMetadataResponse, error) {
+func (client *client) getConsumerMetadata(consumerGroup string, attemptsRemaining int) (*ConsumerMetadataResponse, error) {
+	retry := func(err error) (*ConsumerMetadataResponse, error) {
+		if attemptsRemaining > 0 {
+			Logger.Printf("client/coordinator Retrying after %dms... (%d attempts remaining)\n", client.conf.Metadata.Retry.Backoff/time.Millisecond, attemptsRemaining)
+			time.Sleep(client.conf.Metadata.Retry.Backoff)
+			return client.getConsumerMetadata(consumerGroup, attemptsRemaining-1)
+		}
+		return nil, err
+	}
+
 	for broker := client.any(); broker != nil; broker = client.any() {
 		Logger.Printf("client/coordinator Requesting coordinator for consumergoup %s from %s.\n", consumerGroup, broker.Addr())
 
@@ -695,26 +698,13 @@ func (client *client) getConsumerMetadata(consumerGroup string, retriesRemaining
 				time.Sleep(2 * time.Second)
 			}
 
-			if retriesRemaining > 0 {
-				Logger.Printf("Retrying after %dms... (%d retries remaining)\n", client.conf.Metadata.Retry.Backoff/time.Millisecond, retriesRemaining)
-				time.Sleep(client.conf.Metadata.Retry.Backoff)
-				return client.getConsumerMetadata(consumerGroup, retriesRemaining-1)
-			}
-			return nil, ErrConsumerCoordinatorNotAvailable
-
+			return retry(ErrConsumerCoordinatorNotAvailable)
 		default:
 			return nil, response.Err
 		}
 	}
 
-	Logger.Println("Out of available brokers to request consumer metadata from.")
-
-	if retriesRemaining > 0 {
-		Logger.Printf("Resurrecting dead brokers after %dms... (%d retries remaining)\n", client.conf.Metadata.Retry.Backoff/time.Millisecond, retriesRemaining)
-		time.Sleep(client.conf.Metadata.Retry.Backoff)
-		client.resurrectDeadBrokers()
-		return client.getConsumerMetadata(consumerGroup, retriesRemaining-1)
-	}
-
-	return nil, ErrOutOfBrokers
+	Logger.Println("client/coordinator No broker available to send consumer metadata request to.")
+	client.resurrectDeadBrokers()
+	return retry(ErrOutOfBrokers)
 }
